@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 """magiccache is a magic cache :-) see README."""
+import argparse
 import hashlib
 import os
 import os.path
-import re
+import sys
 from errno import EPERM
-from logging import error, getLogger
-from optparse import OptionParser
-from pprint import pprint
-from sys import exit, stderr
+from logging import error
 
+import ptrace
 from ptrace import PtraceError
-from ptrace.ctypes_tools import formatAddress
-from ptrace.debugger import (Application, NewProcessEvent, ProcessExecution,
+from ptrace.debugger import (NewProcessEvent, ProcessExecution,
                              ProcessExit, ProcessSignal, PtraceDebugger)
 from ptrace.debugger.process import PtraceProcess
-from ptrace.error import PTRACE_ERRORS, writeError
-from ptrace.func_arg import FunctionArgument
-from ptrace.func_call import FunctionCall, FunctionCallOptions
-from ptrace.syscall import (FILENAME_ARGUMENTS, SOCKET_SYSCALL_NAMES,
-                            SYSCALL_NAMES, SYSCALL_PROTOTYPES, PtraceSyscall)
+from ptrace.error import PTRACE_ERRORS
+from ptrace.func_call import FunctionCallOptions
+from ptrace.syscall import PtraceSyscall
 
-# ToDo: drop Application. It's too restrictive.
 # ToDo: tcache and testcache are already reserved on GitHub.
 #       bincache/bcache? genericcache?
-# How about slowtestcache?
+# How about slowtestcache? magiccache?
 
 
 class Inputs:
@@ -56,7 +51,7 @@ class Utils:
     @staticmethod
     def read_c_string(process: PtraceProcess, addr) -> str:
         """Read C-String from process memory space at addr and return it."""
-        data, truncated = process.read_c_string(addr, 5000)
+        data, truncated = process.readCString(addr, 5000)
         if truncated:
             return None  # fail in an obvious way for now
         return data
@@ -107,7 +102,6 @@ class SyscallListener:
 
     def __init__(self):
         self.inputs = Inputs()
-        return
 
     @staticmethod
     def ignore_syscall(syscall: PtraceSyscall) -> bool:
@@ -121,7 +115,7 @@ class SyscallListener:
     def display_syscall(syscall: PtraceSyscall) -> None:
         print(f"{syscall.format():80s} = {syscall.result_text}")
 
-    def on_signal(self, event) -> None:
+    def on_signal(self, _event) -> None:
         # ProcessSignal has “signum” and “name” attributes
         # Note: ProcessSignal has a display() method to display its content.
         #       Use it just after receiving the message because it reads
@@ -145,7 +139,8 @@ class SyscallListener:
         # use process.parent attribute to get the parent process.
         process = event.process
         error("*** New process %s ***" % process.pid)
-        self.prepareProcess(process)
+        # TODO: where is prepareProcess gone?
+        # self.prepareProcess(process)
 
     def on_process_execution(self, event) -> None:
         process = event.process
@@ -175,8 +170,8 @@ class SyscallListener:
                 else:
                     print(f"> Abort: Not readonly access to {filename}")
 
-                fd: int = syscall.result
-                self.filedescriptor_to_path[fd] = filename
+                openat_fd: int = syscall.result
+                self.filedescriptor_to_path[openat_fd] = filename
 
             if syscall.name == "access":
                 filename = Utils.read_filename_from_syscall_parameter(
@@ -196,55 +191,38 @@ class SyscallListener:
                 self.inputs.cache_stat(filename)
 
             if syscall.name == "fstat":
-                fd: int = syscall['fd'].value
-                self.inputs.cache_stat(self.filedescriptor_to_path[fd])
+                stat_fd: int = syscall['fd'].value
+                self.inputs.cache_stat(self.filedescriptor_to_path[stat_fd])
 
             if syscall.name == "close":
-                fd: int = syscall['fd'].value
-                del self.filedescriptor_to_path[fd]
+                close_fd: int = syscall['fd'].value
+                del self.filedescriptor_to_path[close_fd]
 
 
-class TCache(Application):
+class MyDebuggerWrapper:
+    """Main logic class?! Merge with SyscallListener?"""
 
     def __init__(self):
-        Application.__init__(self)
-
         self.debugger = PtraceDebugger()
         self.debugger.traceFork()
         self.debugger.traceExec()
         self.debugger.traceClone()
         self.debugger.enableSysgood()
 
-        self.parse_options()
-
-        self._output = None
-
-        # Normal log level:
-        self.options.debug = False
-        self.options.verbose = False
-        self.options.quiet = False
-        self._setupLog(stderr)
-
         self.syscall_listener = SyscallListener()
 
     def __del__(self):
         self.debugger.quit()
 
-    def parse_options(self):
-        parser = OptionParser(
-            usage="%prog [options] -- program [arg1 arg2 ...]")
-        self.createCommonOptions(parser)
-
-        self.options, self.program = parser.parse_args()
-
-        self.processOptions()
-
-    def run_debugger(self):
+    def run(self, program):
         """Debug process and trigger syscall_listener on every syscall."""
         # Create stopped process (via fork followed by PTRACE_TRACEME) with
         # given parameters
         try:
-            pid: int = self.createChild(self.program)
+            pid: int = ptrace.debugger.child.createChild(program,
+                                                         False,  # print stdout/stderr
+                                                         None)  # copy Env
+
             process: PtraceProcess = self.debugger.addProcess(
                 pid, is_attached=True)
         except (ProcessExit, PtraceError) as err:
@@ -280,21 +258,82 @@ class TCache(Application):
                 self.syscall_listener.on_process_execution(process_exec)
                 process_exec.process.syscall()
 
-    def main(self):
+
+class TCache():
+    """
+    This is basically the user interface class.
+
+    It will probably also contain stuff like printing statistics and clearing cache.
+    """
+
+    def __init__(self, args):
+        self.args = args
+
+    @staticmethod
+    def run_and_collect_inputs(args) -> Inputs:
+        debugger = MyDebuggerWrapper()
         try:
-            self.run_debugger()
-        except ProcessExit as event:
-            self.processExited(event)
+            # "must be a tuple or list" ??
+            debugger.run([args.program])
+        except ProcessExit:  # as event:
+            # FIXME: where is processExited?
+            # processExited(event)
+            pass
         except PtraceError as err:
-            error("ptrace() error: %s" % err)
+            print(f"ptrace() error: {err}")
         except KeyboardInterrupt:
-            error("Interrupted.")
-        except PTRACE_ERRORS as err:
-            writeError(getLogger(), err, "Debugger error")
+            print("Interrupted.")
+        except PTRACE_ERRORS as err:  # noqa: W0703
+            print(f"Debugger error {err}")
 
         print("\n\nEverything to cache:")
-        self.syscall_listener.inputs.print_summary()
+        return debugger.syscall_listener.inputs
+
+    @staticmethod
+    def return_cached_or_run():
+        pass
+
+    def main(self):
+        if self.args.program:
+            inputs = TCache.run_and_collect_inputs(self.args)
+            inputs.print_summary()
+
+
+def parse_args(argv):
+    # short options taken over from ccache for familiarity
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "program",
+        help="Full command line with parameters which this tool is supposed to cache")
+    parser.add_argument(
+        "-v",
+        "-verbose",
+        action="store_true",
+        help="Print lots of logs to stdout (not yet implemented)")
+    parser.add_argument(
+        "-s",
+        "-stats",
+        action="store_true",
+        help="Print statistics on how much was cached (not yet implemented)")
+    parser.add_argument(
+        "-verify",
+        action="store_true",
+        help="Run program and verify cache instead of using cached results (not yet implemented)")
+    parser.add_argument(
+        "-C",
+        "-clear_cache",
+        action="store_true",
+        help="Remove everything from cache (not yet implemented)")
+    parser.add_argument(
+        "-z",
+        "-clear_stats",
+        action="store_true",
+        help="Reset all statistics to 0 (not yet implemented)")
+    parser.add_argument("--version", action="store_true",
+                        help="Print version (not yet implemented)")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    TCache().main()
+    args = parse_args(sys.argv[1:])
+    TCache(args).main()
