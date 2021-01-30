@@ -26,25 +26,64 @@ class Inputs:
     """Holds collection of all inputs which should lead to the same output."""
 
     files_to_hash = {}  # path -> hash
-    files_to_stat = {}  # path -> stat
+    files_to_stat = {}  # fd_or_filename -> stat
+    files_to_access = {}  # (pathname, mode) -> result
+
+    # ToDo:
+    # - command that was executed
+    # - cwd/pwd
+    # - some env variables like SOURCE_DATE_EPOCH
+    #   (never ending list... but adding everything would be overkill)
+    # - uid, gid ?!
 
     def cache_additional_file(self, filename: str) -> None:
         self.files_to_hash[filename] = Utils.get_digest(filename)
 
-    def cache_stat(self, filename: str) -> None:
+    def cache_stat(self, fd_or_filename) -> None:
         try:
-            stat_result: os.stat_result = os.stat(filename)
+            stat_result: os.stat_result = os.stat(fd_or_filename)
         except FileNotFoundError:
             stat_result = None
 
-        self.files_to_stat[filename] = stat_result
+        self.files_to_stat[fd_or_filename] = stat_result
+
+    def cache_access(self, pathname, mode, result) -> None:
+        self.files_to_access[(pathname, mode)] = result
 
     def print_summary(self) -> None:
         for file, digest in self.files_to_hash.items():
             print(f"hash: {file} = {digest}")
 
-        for file, stat_result in self.files_to_stat.items():
-            print(f"stat: {file} = {stat_result}")
+        for fd_or_filename, stat_result in self.files_to_stat.items():
+            print(f"stat: {fd_or_filename} = {stat_result}")
+
+        for access_params, access_result in self.files_to_access.items():
+            print(f"access: {access_params} = {access_result}")
+
+
+class Outputs:
+    """Holds collection of all outputs which a program has produced."""
+
+    files_to_write = {}  # path -> content
+    # ToDo: intermixed stdout and stderr
+    stdout: str = ""
+    stderr: str = ""
+
+    def write_file(self, filename, content) -> None:
+        self.files_to_write[filename] += content
+
+    def write_stdout(self, stdout) -> None:
+        self.stdout += stdout
+
+    def write_stderr(self, stderr) -> None:
+        self.stderr += stderr
+
+    def print_summary(self) -> None:
+        print(f"stdout: {self.stdout}")
+        print(f"stderr: {self.stderr}")
+
+        for file, content in self.files_to_write.items():
+            print(f"stat: {file} = {content}")
 
 
 class Utils:
@@ -71,6 +110,10 @@ class Utils:
         if not os.path.exists(file_path):
             return None
 
+        # ToDo: investigate intention. cache directory content?
+        if(os.path.isdir(file_path)):
+            return "directory"
+
         h = hashlib.sha256()
 
         with open(file_path, 'rb') as file:
@@ -88,22 +131,85 @@ O_READONLY: int = 0
 O_CLOEXEC: int = 0o2000000
 
 
+class FiledescriptorManager:
+    """Tracking and especially debugging file descriptor access requires more than a simple array access."""
+
+    fd_to_file_and_state = {}
+
+    def __init__(self):
+        self.fd_to_file_and_state[0] = {
+            "filename": 0, "state": "open", "source": ["default"]}
+        self.fd_to_file_and_state[1] = {
+            "filename": 1, "state": "open", "source": ["default"]}
+        self.fd_to_file_and_state[2] = {
+            "filename": 2, "state": "open", "source": ["default"]}
+
+    def print_all(self) -> None:
+        print("Known file desciptors:")
+        for fd, file_and_state in self.fd_to_file_and_state.items():
+            print("---------------")
+            print(f"{fd}")
+            print(f"filename: {file_and_state['filename']}")
+            print(f"state: {file_and_state['state']}")
+            for src in file_and_state['source']:
+                print(f"action: {src}")
+
+    def open(self, fd, file, source) -> None:
+        if fd in self.fd_to_file_and_state:
+            # move to some sort of history
+            pass
+
+        self.fd_to_file_and_state[fd] = {
+            "filename": file, "state": "open",
+            "source": [f"open via {source}"]}
+
+    def close(self, fd, source) -> None:
+        if fd not in self.fd_to_file_and_state:
+            self.print_all()
+            raise Exception(
+                f"closing unknown fd {fd}")
+
+        if self.fd_to_file_and_state[fd]["state"] == "closed":
+            self.print_all()
+            raise Exception(
+                f"closing closed fd {fd}")
+
+        self.fd_to_file_and_state[fd]["state"] = "closed"
+        self.fd_to_file_and_state[fd]["source"].append(f"close via {source}")
+
+    def get_filename(self, fd, source) -> None:
+        if fd not in self.fd_to_file_and_state:
+            self.print_all()
+            raise Exception(
+                f"retrieving unknown fd {fd}")
+
+        if self.fd_to_file_and_state[fd]["state"] != "open":
+            self.print_all()
+            raise Exception(
+                f"retrieving closed fd {fd} => {self.fd_to_file_and_state[fd]}")
+
+        self.fd_to_file_and_state[fd]["source"].append(
+            f"get_filename via {source}")
+        return self.fd_to_file_and_state[fd]["filename"]
+
+
 class SyscallListener:
     # In theory this class could be made ptrace independent.
     # But thats a huge amount of wrappers.
     # And what's even the point? This handles Linux specific syscalls anyway.
 
+    filedescriptors = FiledescriptorManager()
     inputs: Inputs
-
-    # stdout, stderr... but mixed... puh...
-    output: int
-
-    filedescriptor_to_path = {}
+    output: Outputs
 
     def __init__(self):
         self.inputs = Inputs()
 
-    @staticmethod
+    # ToDo: put this somewhere more global, compare verbose argument
+    def log(self, line) -> None:
+        print(line)
+
+    @ staticmethod
     def ignore_syscall(syscall: PtraceSyscall) -> bool:
         # A whitelist for file open etc would be easier, but first we need to
         # find those interesting functions...
@@ -111,16 +217,20 @@ class SyscallListener:
                   "write", "mmap", "munmap", "brk", "sbrk"}
         return syscall.name in ignore
 
-    @staticmethod
-    def display_syscall(syscall: PtraceSyscall) -> None:
-        print(f"{syscall.format():80s} = {syscall.result_text}")
+    @ staticmethod
+    def syscall_to_str(syscall: PtraceSyscall) -> str:
+        return f"{syscall.format():80s} = {syscall.result_text}"
 
-    def on_signal(self, _event) -> None:
+    @ staticmethod
+    def display_syscall(syscall: PtraceSyscall) -> None:
+        print(SyscallListener.syscall_to_str(syscall))
+
+    def on_signal(self, event) -> None:
         # ProcessSignal has “signum” and “name” attributes
         # Note: ProcessSignal has a display() method to display its content.
         #       Use it just after receiving the message because it reads
         #       process memory to analyze the reasons why the signal was sent.
-        return
+        self.log(f"ToDo: handle signal {event}")
 
     def on_process_exited(self, event: ProcessExit) -> None:
         # process exited with an exitcode, killed by a signal or exited
@@ -128,7 +238,7 @@ class SyscallListener:
         # (both can be None)
         state = event.process.syscall_state
         if (state.next_event == "exit") and state.syscall:
-            # Process was killed by a syscall
+            self.log("Process was killed by a syscall:")
             SyscallListener.display_syscall(state.syscall)
 
         # Display exit message
@@ -158,27 +268,31 @@ class SyscallListener:
         ))
         if syscall and syscall.result is not None \
                 and not SyscallListener.ignore_syscall(syscall):
-            SyscallListener.display_syscall(syscall)
+            log_syscall = True
 
             if syscall.name == "openat":
                 flags: int = syscall['flags'].value
-                readonly: bool = flags == O_READONLY or flags == O_CLOEXEC
+                readonly: bool = flags in (O_READONLY, O_CLOEXEC)
                 filename = Utils.read_filename_from_syscall_parameter(
                     syscall, 'filename')
+
                 if readonly:
                     self.inputs.cache_additional_file(filename)
+                    log_syscall = False
                 else:
                     print(f"> Abort: Not readonly access to {filename}")
 
                 openat_fd: int = syscall.result
-                self.filedescriptor_to_path[openat_fd] = filename
+                self.filedescriptors.open(
+                    openat_fd, filename, self.syscall_to_str(syscall))
 
             if syscall.name == "access":
                 filename = Utils.read_filename_from_syscall_parameter(
                     syscall, 'filename')
-                # ToDo: for now just cache the entire file
-                print(f"> cache file access rights: {filename}")
-                self.inputs.cache_additional_file(filename)
+                mode = syscall['mode']
+                result = syscall.result
+                self.inputs.cache_access(filename, mode, result)
+                log_syscall = False
 
             if syscall.name == "stat":
                 filename = Utils.read_filename_from_syscall_parameter(
@@ -189,14 +303,23 @@ class SyscallListener:
                 # depending on a myriad of different things.
                 # Therefore stats is called redundantly from Python.
                 self.inputs.cache_stat(filename)
+                log_syscall = False
 
             if syscall.name == "fstat":
                 stat_fd: int = syscall['fd'].value
-                self.inputs.cache_stat(self.filedescriptor_to_path[stat_fd])
+                self.inputs.cache_stat(
+                    self.filedescriptors.get_filename(
+                        stat_fd, self.syscall_to_str(syscall)))
+                log_syscall = False
 
             if syscall.name == "close":
                 close_fd: int = syscall['fd'].value
-                del self.filedescriptor_to_path[close_fd]
+                self.filedescriptors.close(
+                    close_fd, self.syscall_to_str(syscall))
+                log_syscall = False
+
+            if log_syscall:
+                SyscallListener.display_syscall(syscall)
 
 
 class MyDebuggerWrapper:
@@ -269,12 +392,11 @@ class TCache():
     def __init__(self, args):
         self.args = args
 
-    @staticmethod
+    @ staticmethod
     def run_and_collect_inputs(args) -> Inputs:
         debugger = MyDebuggerWrapper()
         try:
-            # "must be a tuple or list" ??
-            debugger.run([args.program])
+            debugger.run(args.program)
         except ProcessExit:  # as event:
             # FIXME: where is processExited?
             # processExited(event)
@@ -283,13 +405,11 @@ class TCache():
             print(f"ptrace() error: {err}")
         except KeyboardInterrupt:
             print("Interrupted.")
-        except PTRACE_ERRORS as err:  # noqa: W0703
-            print(f"Debugger error {err}")
 
         print("\n\nEverything to cache:")
         return debugger.syscall_listener.inputs
 
-    @staticmethod
+    @ staticmethod
     def return_cached_or_run():
         pass
 
@@ -303,7 +423,7 @@ def parse_args(argv):
     # short options taken over from ccache for familiarity
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "program",
+        "program", nargs='+',
         help="Full command line with parameters which this tool is supposed to cache")
     parser.add_argument(
         "-v",
