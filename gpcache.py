@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""magiccache is a magic cache :-) see README."""
+"""GPCache is a general purpose cache for pretty much any cachable tool you run repeatadly. See README for more info."""
 import argparse
 import hashlib
 import os
@@ -17,10 +17,6 @@ from ptrace.error import PTRACE_ERRORS
 from ptrace.func_call import FunctionCallOptions
 from ptrace.syscall import PtraceSyscall
 
-# ToDo: tcache and testcache are already reserved on GitHub.
-#       bincache/bcache? genericcache?
-# How about slowtestcache? magiccache?
-
 
 class Inputs:
     """Holds collection of all inputs which should lead to the same output."""
@@ -37,7 +33,11 @@ class Inputs:
     # - uid, gid ?!
 
     def cache_additional_file(self, filename: str) -> None:
-        self.files_to_hash[filename] = Utils.get_digest(filename)
+        if filename == "/dev/urandom":
+            # bad idea trying to hash that... probably check for regular files?
+            error("random number is used!")
+        else:
+            self.files_to_hash[filename] = Utils.calculate_hash(filename)
 
     def cache_stat(self, fd_or_filename) -> None:
         try:
@@ -105,7 +105,7 @@ class Utils:
         return filename
 
     @staticmethod
-    def get_digest(file_path):
+    def calculate_hash(file_path):
         # Reuse stat call? Usually there was a stat call before this.
         if not os.path.exists(file_path):
             return None
@@ -382,15 +382,15 @@ class MyDebuggerWrapper:
                 process_exec.process.syscall()
 
 
-class TCache():
+class GPCache():
     """
     This is basically the user interface class.
 
     It will probably also contain stuff like printing statistics and clearing cache.
     """
 
-    def __init__(self, args):
-        self.args = args
+    def __init__(self, argv):
+        self.args = parse_args(argv)
 
     @ staticmethod
     def run_and_collect_inputs(args) -> Inputs:
@@ -415,7 +415,7 @@ class TCache():
 
     def main(self):
         if self.args.program:
-            inputs = TCache.run_and_collect_inputs(self.args)
+            inputs = GPCache.run_and_collect_inputs(self.args)
             inputs.print_summary()
 
 
@@ -455,5 +455,4 @@ def parse_args(argv):
 
 
 if __name__ == "__main__":
-    args = parse_args(sys.argv[1:])
-    TCache(args).main()
+    GPCache(sys.argv[1:]).main()
