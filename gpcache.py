@@ -13,7 +13,6 @@ from ptrace import PtraceError
 from ptrace.debugger import (NewProcessEvent, ProcessExecution,
                              ProcessExit, ProcessSignal, PtraceDebugger)
 from ptrace.debugger.process import PtraceProcess
-from ptrace.error import PTRACE_ERRORS
 from ptrace.func_call import FunctionCallOptions
 from ptrace.syscall import PtraceSyscall
 
@@ -202,35 +201,36 @@ class SyscallListener:
     inputs: Inputs
     output: Outputs
 
-    def __init__(self):
+    def __init__(self, verbose):
+        self.verbose = verbose
+
         self.inputs = Inputs()
 
     # ToDo: put this somewhere more global, compare verbose argument
-    def log(self, line) -> None:
-        print(line)
+    def log_verbose(self, line) -> None:
+        if self.verbose:
+            print(line)
 
     @ staticmethod
     def ignore_syscall(syscall: PtraceSyscall) -> bool:
         # A whitelist for file open etc would be easier, but first we need to
         # find those interesting functions...
-        ignore = {"arch_prctl", "mprotect", "pread64", "pwrite64", "read",
-                  "write", "mmap", "munmap", "brk", "sbrk"}
+        ignore = {"arch_prctl", "mprotect", "mmap", "munmap", "brk", "sbrk"}
         return syscall.name in ignore
 
     @ staticmethod
     def syscall_to_str(syscall: PtraceSyscall) -> str:
         return f"{syscall.format():80s} = {syscall.result_text}"
 
-    @ staticmethod
-    def display_syscall(syscall: PtraceSyscall) -> None:
-        print(SyscallListener.syscall_to_str(syscall))
+    def display_syscall(self, syscall: PtraceSyscall) -> None:
+        self.log_verbose(SyscallListener.syscall_to_str(syscall))
 
     def on_signal(self, event) -> None:
         # ProcessSignal has “signum” and “name” attributes
         # Note: ProcessSignal has a display() method to display its content.
         #       Use it just after receiving the message because it reads
         #       process memory to analyze the reasons why the signal was sent.
-        self.log(f"ToDo: handle signal {event}")
+        self.log_verbose(f"ToDo: handle signal {event}")
 
     def on_process_exited(self, event: ProcessExit) -> None:
         # process exited with an exitcode, killed by a signal or exited
@@ -238,23 +238,23 @@ class SyscallListener:
         # (both can be None)
         state = event.process.syscall_state
         if (state.next_event == "exit") and state.syscall:
-            self.log("Process was killed by a syscall:")
-            SyscallListener.display_syscall(state.syscall)
+            self.log_verbose("Process was killed by a syscall:")
+            self.display_syscall(state.syscall)
 
         # Display exit message
-        error(f"*** {event} ***")
+        self.log_verbose(f"*** {event} ***")
 
     def on_new_process_event(self, event: NewProcessEvent) -> None:
         # new process created, e.g. after a fork() syscall
         # use process.parent attribute to get the parent process.
         process = event.process
-        error("*** New process %s ***" % process.pid)
+        self.log_verbose("*** New process %s ***" % process.pid)
         # TODO: where is prepareProcess gone?
         # self.prepareProcess(process)
 
     def on_process_execution(self, event) -> None:
         process = event.process
-        error("*** Process %s execution ***" % process.pid)
+        self.log_verbose("*** Process %s execution ***" % process.pid)
 
     def on_syscall(self, process: PtraceProcess):
         state = process.syscall_state
@@ -280,7 +280,8 @@ class SyscallListener:
                     self.inputs.cache_additional_file(filename)
                     log_syscall = False
                 else:
-                    print(f"> Abort: Not readonly access to {filename}")
+                    self.log_verbose(
+                        f"> Abort: Not readonly access to {filename}")
 
                 openat_fd: int = syscall.result
                 self.filedescriptors.open(
@@ -319,20 +320,22 @@ class SyscallListener:
                 log_syscall = False
 
             if log_syscall:
-                SyscallListener.display_syscall(syscall)
+                self.display_syscall(syscall)
 
 
 class MyDebuggerWrapper:
     """Main logic class?! Merge with SyscallListener?"""
 
-    def __init__(self):
+    def __init__(self, verbose):
+        self.verbose = verbose
+
         self.debugger = PtraceDebugger()
         self.debugger.traceFork()
         self.debugger.traceExec()
         self.debugger.traceClone()
         self.debugger.enableSysgood()
 
-        self.syscall_listener = SyscallListener()
+        self.syscall_listener = SyscallListener(verbose)
 
     def __del__(self):
         self.debugger.quit()
@@ -394,7 +397,7 @@ class GPCache():
 
     @ staticmethod
     def run_and_collect_inputs(args) -> Inputs:
-        debugger = MyDebuggerWrapper()
+        debugger = MyDebuggerWrapper(args.verbose)
         try:
             debugger.run(args.program)
         except ProcessExit:  # as event:
@@ -427,26 +430,26 @@ def parse_args(argv):
         help="Full command line with parameters which this tool is supposed to cache")
     parser.add_argument(
         "-v",
-        "-verbose",
+        "--verbose",
         action="store_true",
-        help="Print lots of logs to stdout (not yet implemented)")
+        help="Print lots of logs to stdout (later to file)")
     parser.add_argument(
         "-s",
-        "-stats",
+        "--stats",
         action="store_true",
         help="Print statistics on how much was cached (not yet implemented)")
     parser.add_argument(
-        "-verify",
+        "--verify",
         action="store_true",
         help="Run program and verify cache instead of using cached results (not yet implemented)")
     parser.add_argument(
         "-C",
-        "-clear_cache",
+        "--clear_cache",
         action="store_true",
         help="Remove everything from cache (not yet implemented)")
     parser.add_argument(
         "-z",
-        "-clear_stats",
+        "--clear_stats",
         action="store_true",
         help="Reset all statistics to 0 (not yet implemented)")
     parser.add_argument("--version", action="store_true",
