@@ -5,6 +5,7 @@ import hashlib
 import os
 import os.path
 import sys
+import yaml
 from errno import EPERM
 from logging import error
 
@@ -20,12 +21,12 @@ from ptrace.syscall import PtraceSyscall
 class Inputs:
     """Holds collection of all inputs which should lead to the same output."""
 
+    command_line: str
     files_to_hash = {}  # path -> hash
     files_to_stat = {}  # fd_or_filename -> stat
     files_to_access = {}  # (pathname, mode) -> result
 
     # ToDo:
-    # - command that was executed
     # - cwd/pwd
     # - some env variables like SOURCE_DATE_EPOCH
     #   (never ending list... but adding everything would be overkill)
@@ -36,7 +37,8 @@ class Inputs:
             # bad idea trying to hash that... probably check for regular files?
             error("random number is used!")
         else:
-            self.files_to_hash[filename] = Utils.calculate_hash(filename)
+            self.files_to_hash[filename] = Utils.calculate_hash_of_file(
+                filename)
 
     def cache_stat(self, fd_or_filename) -> None:
         try:
@@ -50,6 +52,8 @@ class Inputs:
         self.files_to_access[(pathname, mode)] = result
 
     def print_summary(self) -> None:
+        print(f"command_line: {self.command_line}")
+
         for file, digest in self.files_to_hash.items():
             print(f"hash: {file} = {digest}")
 
@@ -104,7 +108,16 @@ class Utils:
         return filename
 
     @staticmethod
-    def calculate_hash(file_path):
+    def calculate_hash_of_str(string):
+        if isinstance(string, list):
+            string = '_'.join(string)
+        if isinstance(string, str):
+            string = string.encode('ASCII')
+
+        return hashlib.sha256(string).hexdigest()
+
+    @ staticmethod
+    def calculate_hash_of_file(file_path):
         # Reuse stat call? Usually there was a stat call before this.
         if not os.path.exists(file_path):
             return None
@@ -124,6 +137,52 @@ class Utils:
                 h.update(chunk)
 
         return h.hexdigest()
+
+
+class FileBackend:
+    """Stores cache in local files"""
+
+    # ToDo: XDG
+    # ToDo: configurable
+    CACHE_DIR: str = ".cache_dir"
+
+    def store(self, command_line, inputs: Inputs, outputs: Outputs) -> str:
+        """Stores data in cache and returns unique cache identifier"""
+
+        path = self._get_directory_name(command_line)
+
+        # this should actually iterate over all inputs, regardless of type and
+        # check stats, access etc in exactly the right order
+        for file in inputs.files_to_hash:
+            path += f"/{Utils.calculate_hash_of_file(file)}"
+
+            # for debugging and reports about why cache misses happened store
+            # filenames.
+            os.makedirs(path, 0o777, True)
+            with open(f"{path}/input.yaml", "w") as input_yaml:
+                yaml.safe_dump(file, input_yaml)
+
+        with open(f"{path}/outputs.yaml", "w") as outputs_yaml:
+            yaml.safe_dump(outputs.files_to_write, outputs_yaml)
+            yaml.safe_dump(outputs.stdout, outputs_yaml)
+            yaml.safe_dump(outputs.stderr, outputs_yaml)
+
+        return path
+
+    def retrieve(self, command_line) -> Outputs:
+        # Descend directory tree as long as there is exactly one further
+        # directory or outputs.yaml
+        pass
+
+    def clear(self) -> None:
+        pass
+
+    # Does python have a concept of private methods?
+    def _get_directory_name(self, command_line):
+        command_line_hash = Utils.calculate_hash_of_str(command_line)
+        executable_hash = Utils.calculate_hash_of_file(command_line[0])
+        directory = f"{self.CACHE_DIR}/{command_line_hash}/{executable_hash}"
+        return directory
 
 
 O_READONLY: int = 0
@@ -218,6 +277,10 @@ class SyscallListener:
 
         self.inputs = Inputs()
         self.outputs = Outputs()
+
+    # Terrible design. Pass Inputs from outside?!
+    def set_command_line(self, command_line):
+        self.inputs.command_line = command_line
 
     # ToDo: put this somewhere more global, compare verbose argument
     def log_verbose(self, line) -> None:
@@ -429,6 +492,8 @@ class GPCache():
     @ staticmethod
     def run_and_collect(args):
         debugger = MyDebuggerWrapper(args.verbose)
+        debugger.syscall_listener.set_command_line(args.program)
+
         try:
             debugger.run(args.program)
         except ProcessExit:  # as event:
@@ -448,12 +513,18 @@ class GPCache():
         pass
 
     def main(self):
+        backend = FileBackend()
+        # outputs = backend.retrieve(self.args)
+
         if self.args.program:
             inputs, outputs = GPCache.run_and_collect(self.args)
             print("\n\nEverything to cache:")
             inputs.print_summary()
             print("\n\nCached output:")
             outputs.print_summary()
+
+            location = backend.store(self.args.program, inputs, outputs)
+            print(f"cached data stored in {location}")
 
 
 def parse_args(argv):

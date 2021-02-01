@@ -1,6 +1,6 @@
 .vscode
 tests/cpp/build
-
+.cache_dir
 
 
 # Python default .gitignore:
