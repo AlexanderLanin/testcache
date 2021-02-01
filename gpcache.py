@@ -71,10 +71,10 @@ class Outputs:
     def write_file(self, filename, content) -> None:
         self.files_to_write[filename] += content
 
-    def write_stdout(self, stdout) -> None:
-        self.stdout += stdout
+    def write_stdout(self, stdout: str) -> None:
+        self.stdout = self.stdout + stdout
 
-    def write_stderr(self, stderr) -> None:
+    def write_stderr(self, stderr: str) -> None:
         self.stderr += stderr
 
     def print_summary(self) -> None:
@@ -92,7 +92,7 @@ class Utils:
         data, truncated = process.readCString(addr, 5000)
         if truncated:
             return None  # fail in an obvious way for now
-        return data
+        return data.decode('ASCII')
 
     # Surprisingly common use case
     @staticmethod
@@ -142,6 +142,18 @@ class FiledescriptorManager:
             "filename": 1, "state": "open", "source": ["default"]}
         self.fd_to_file_and_state[2] = {
             "filename": 2, "state": "open", "source": ["default"]}
+
+    def print_fd(self, fd) -> None:
+        print(f"file desciptor {fd}:")
+        # ToDo wrap all access and allow readonly array access for
+        # FiledescriptorManager?
+        file_and_state = self.fd_to_file_and_state[fd]
+        print("---------------")
+        print(f"filename: {file_and_state['filename']}")
+        print(f"state: {file_and_state['state']}")
+        for src in file_and_state['source']:
+            print(f"action: {src}")
+        print("---------------")
 
     def print_all(self) -> None:
         print("Known file desciptors:")
@@ -199,12 +211,13 @@ class SyscallListener:
 
     filedescriptors = FiledescriptorManager()
     inputs: Inputs
-    output: Outputs
+    outputs: Outputs
 
     def __init__(self, verbose):
         self.verbose = verbose
 
         self.inputs = Inputs()
+        self.outputs = Outputs()
 
     # ToDo: put this somewhere more global, compare verbose argument
     def log_verbose(self, line) -> None:
@@ -215,7 +228,15 @@ class SyscallListener:
     def ignore_syscall(syscall: PtraceSyscall) -> bool:
         # A whitelist for file open etc would be easier, but first we need to
         # find those interesting functions...
-        ignore = {"arch_prctl", "mprotect", "mmap", "munmap", "brk", "sbrk"}
+        ignore = {
+            "arch_prctl",
+            "mprotect",
+            "mmap",
+            "munmap",
+            "brk",
+            "sbrk",
+            "read",
+            "pread64"}
         return syscall.name in ignore
 
     @ staticmethod
@@ -319,6 +340,16 @@ class SyscallListener:
                     close_fd, self.syscall_to_str(syscall))
                 log_syscall = False
 
+            if syscall.name in ("write"):
+                write_fd: int = syscall['fd'].value
+                self.filedescriptors.get_filename(
+                    write_fd, self.syscall_to_str(syscall))
+
+                buf: str = Utils.read_c_string(
+                    syscall.process, syscall['buf'].value)
+                if write_fd == 1:
+                    self.outputs.write_stdout(buf)
+
             if log_syscall:
                 self.display_syscall(syscall)
 
@@ -396,7 +427,7 @@ class GPCache():
         self.args = parse_args(argv)
 
     @ staticmethod
-    def run_and_collect_inputs(args) -> Inputs:
+    def run_and_collect(args):
         debugger = MyDebuggerWrapper(args.verbose)
         try:
             debugger.run(args.program)
@@ -409,8 +440,8 @@ class GPCache():
         except KeyboardInterrupt:
             print("Interrupted.")
 
-        print("\n\nEverything to cache:")
-        return debugger.syscall_listener.inputs
+        return (debugger.syscall_listener.inputs,
+                debugger.syscall_listener.outputs)
 
     @ staticmethod
     def return_cached_or_run():
@@ -418,8 +449,11 @@ class GPCache():
 
     def main(self):
         if self.args.program:
-            inputs = GPCache.run_and_collect_inputs(self.args)
+            inputs, outputs = GPCache.run_and_collect(self.args)
+            print("\n\nEverything to cache:")
             inputs.print_summary()
+            print("\n\nCached output:")
+            outputs.print_summary()
 
 
 def parse_args(argv):
