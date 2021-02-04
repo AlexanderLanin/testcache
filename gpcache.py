@@ -2,6 +2,7 @@
 """GPCache is a general purpose cache for pretty much any cachable tool you run repeatadly. See README for more info."""
 import argparse
 import hashlib
+import logging
 import os
 import os.path
 import sys
@@ -52,16 +53,18 @@ class Inputs:
         self.files_to_access[(pathname, mode)] = result
 
     def print_summary(self) -> None:
-        print(f"command_line: {self.command_line}")
+        log = logging.getLogger("gpcache").debug
+
+        log("command_line: %s", self.command_line)
 
         for file, digest in self.files_to_hash.items():
-            print(f"hash: {file} = {digest}")
+            log("hash: %s = %s", file, digest)
 
         for fd_or_filename, stat_result in self.files_to_stat.items():
-            print(f"stat: {fd_or_filename} = {stat_result}")
+            log("stat: %s = %s", fd_or_filename, stat_result)
 
         for access_params, access_result in self.files_to_access.items():
-            print(f"access: {access_params} = {access_result}")
+            log("access: %s = %s", access_params, access_result)
 
 
 class Outputs:
@@ -82,11 +85,13 @@ class Outputs:
         self.stderr += stderr
 
     def print_summary(self) -> None:
-        print(f"stdout: {self.stdout}")
-        print(f"stderr: {self.stderr}")
+        log = logging.getLogger("gpcache").debug
+
+        log("stdout: %s", self.stdout)
+        log("stderr: %s", self.stderr)
 
         for file, content in self.files_to_write.items():
-            print(f"stat: {file} = {content}")
+            log("stat: %s = %s", file, content)
 
 
 class Utils:
@@ -154,13 +159,22 @@ class FileBackend:
         # this should actually iterate over all inputs, regardless of type and
         # check stats, access etc in exactly the right order
         for file in inputs.files_to_hash:
+            path += f"/{Utils.calculate_hash_of_str(file)}"
+
+            os.makedirs(path, 0o777, True)
+
+            filename_file = f"{path}/filename.yaml"
+            if os.path.exists(filename_file):
+                with open(filename_file, "r") as filename_yaml:
+                    o = yaml.safe_load(filename_yaml)
+                    logging.warning(o)
+            else:
+                with open(filename_file, "w") as input_yaml:
+                    yaml.safe_dump(file, input_yaml)
+
             path += f"/{Utils.calculate_hash_of_file(file)}"
 
-            # for debugging and reports about why cache misses happened store
-            # filenames.
-            os.makedirs(path, 0o777, True)
-            with open(f"{path}/input.yaml", "w") as input_yaml:
-                yaml.safe_dump(file, input_yaml)
+        os.makedirs(path, 0o777, True)
 
         with open(f"{path}/outputs.yaml", "w") as outputs_yaml:
             yaml.safe_dump(outputs.files_to_write, outputs_yaml)
@@ -203,26 +217,31 @@ class FiledescriptorManager:
             "filename": 2, "state": "open", "source": ["default"]}
 
     def print_fd(self, fd) -> None:
-        print(f"file desciptor {fd}:")
+        log = logging.getLogger("gpcache").debug
+
+        logging.getLogger("gpcache").debug(f"file desciptor {fd}:")
         # ToDo wrap all access and allow readonly array access for
         # FiledescriptorManager?
         file_and_state = self.fd_to_file_and_state[fd]
-        print("---------------")
-        print(f"filename: {file_and_state['filename']}")
-        print(f"state: {file_and_state['state']}")
+        log("---------------")
+        log(
+            f"filename: {file_and_state['filename']}")
+        log(f"state: {file_and_state['state']}")
         for src in file_and_state['source']:
-            print(f"action: {src}")
-        print("---------------")
+            log(f"action: {src}")
+        log("---------------")
 
     def print_all(self) -> None:
-        print("Known file desciptors:")
+        log = logging.getLogger("gpcache").debug
+
+        log("Known file desciptors:")
         for fd, file_and_state in self.fd_to_file_and_state.items():
-            print("---------------")
-            print(f"{fd}")
-            print(f"filename: {file_and_state['filename']}")
-            print(f"state: {file_and_state['state']}")
+            log("---------------")
+            log(f"{fd}")
+            log(f"filename: {file_and_state['filename']}")
+            log(f"state: {file_and_state['state']}")
             for src in file_and_state['source']:
-                print(f"action: {src}")
+                log(f"action: {src}")
 
     def open(self, fd, file, source) -> None:
         if fd in self.fd_to_file_and_state:
@@ -282,11 +301,6 @@ class SyscallListener:
     def set_command_line(self, command_line):
         self.inputs.command_line = command_line
 
-    # ToDo: put this somewhere more global, compare verbose argument
-    def log_verbose(self, line) -> None:
-        if self.verbose:
-            print(line)
-
     @ staticmethod
     def ignore_syscall(syscall: PtraceSyscall) -> bool:
         # A whitelist for file open etc would be easier, but first we need to
@@ -307,38 +321,48 @@ class SyscallListener:
         return f"{syscall.format():80s} = {syscall.result_text}"
 
     def display_syscall(self, syscall: PtraceSyscall) -> None:
-        self.log_verbose(SyscallListener.syscall_to_str(syscall))
+        logging.getLogger("gpcache").debug(
+            SyscallListener.syscall_to_str(syscall))
 
     def on_signal(self, event) -> None:
         # ProcessSignal has “signum” and “name” attributes
         # Note: ProcessSignal has a display() method to display its content.
         #       Use it just after receiving the message because it reads
         #       process memory to analyze the reasons why the signal was sent.
-        self.log_verbose(f"ToDo: handle signal {event}")
+        logging.getLogger("gpcache").debug(f"ToDo: handle signal {event}")
 
     def on_process_exited(self, event: ProcessExit) -> None:
+        self.outputs.exit = event.exitcode
+        print_event = True
+
         # process exited with an exitcode, killed by a signal or exited
         # abnormally. Note: ProcessExit has “exitcode” and “signum” attributes
         # (both can be None)
         state = event.process.syscall_state
         if (state.next_event == "exit") and state.syscall:
-            self.log_verbose("Process was killed by a syscall:")
-            self.display_syscall(state.syscall)
+
+            # exit all threads in a process
+            if state.syscall.name == "exit_group":
+                print_event = False
 
         # Display exit message
-        self.log_verbose(f"*** {event} ***")
+        if print_event:
+            logging.getLogger("gpcache").debug(f"*** {event} ***")
 
     def on_new_process_event(self, event: NewProcessEvent) -> None:
         # new process created, e.g. after a fork() syscall
         # use process.parent attribute to get the parent process.
         process = event.process
-        self.log_verbose("*** New process %s ***" % process.pid)
+        logging.getLogger("gpcache").debug(
+            "*** New process %s ***", process.pid)
         # TODO: where is prepareProcess gone?
         # self.prepareProcess(process)
 
     def on_process_execution(self, event) -> None:
         process = event.process
-        self.log_verbose("*** Process %s execution ***" % process.pid)
+        logging.getLogger("gpcache").debug(
+            "*** Process %s execution ***",
+            process.pid)
 
     def on_syscall(self, process: PtraceProcess):
         state = process.syscall_state
@@ -364,8 +388,8 @@ class SyscallListener:
                     self.inputs.cache_additional_file(filename)
                     log_syscall = False
                 else:
-                    self.log_verbose(
-                        f"> Abort: Not readonly access to {filename}")
+                    logging.getLogger("gpcache").warning(
+                        "> Abort: Not readonly access to %s", filename)
 
                 openat_fd: int = syscall.result
                 self.filedescriptors.open(
@@ -412,6 +436,10 @@ class SyscallListener:
                     syscall.process, syscall['buf'].value)
                 if write_fd == 1:
                     self.outputs.write_stdout(buf)
+                    log_syscall = False
+                elif write_fd == 2:
+                    self.outputs.write_stderr(buf)
+                    log_syscall = False
 
             if log_syscall:
                 self.display_syscall(syscall)
@@ -440,8 +468,8 @@ class MyDebuggerWrapper:
         # given parameters
         try:
             pid: int = ptrace.debugger.child.createChild(program,
-                                                         False,  # print stdout/stderr
-                                                         None)  # copy Env
+                                                         no_stdout=False,
+                                                         close_fds=False)
 
             process: PtraceProcess = self.debugger.addProcess(
                 pid, is_attached=True)
@@ -460,11 +488,10 @@ class MyDebuggerWrapper:
         while self.debugger:
             try:
                 # We have set breakpoints to occure on syscalls.
-                # Therefore breakpoint are handled by onSyscall.
+                # Therefore breakpoint are handled by on_syscall.
                 break_point = self.debugger.waitSyscall()
                 self.syscall_listener.on_syscall(break_point.process)
-                # Docs: proceed with syscall??
-                # Reality??: break at next one
+                # proceed with unmodified syscall ?!
                 break_point.process.syscall()
             except ProcessExit as interrupt:
                 self.syscall_listener.on_process_exited(interrupt)
@@ -487,7 +514,7 @@ class GPCache():
     """
 
     def __init__(self, argv):
-        self.args = parse_args(argv)
+        self.args = argv
 
     @ staticmethod
     def run_and_collect(args):
@@ -501,9 +528,9 @@ class GPCache():
             # processExited(event)
             pass
         except PtraceError as err:
-            print(f"ptrace() error: {err}")
+            logging.getLogger("gpcache").debug(f"ptrace() error: {err}")
         except KeyboardInterrupt:
-            print("Interrupted.")
+            logging.getLogger("gpcache").debug("Interrupted.")
 
         return (debugger.syscall_listener.inputs,
                 debugger.syscall_listener.outputs)
@@ -518,16 +545,17 @@ class GPCache():
 
         if self.args.program:
             inputs, outputs = GPCache.run_and_collect(self.args)
-            print("\n\nEverything to cache:")
+            logging.getLogger("gpcache").debug("\n\nEverything to cache:")
             inputs.print_summary()
-            print("\n\nCached output:")
+            logging.getLogger("gpcache").debug("\n\nCached output:")
             outputs.print_summary()
 
             location = backend.store(self.args.program, inputs, outputs)
-            print(f"cached data stored in {location}")
+            logging.getLogger("gpcache").debug(
+                f"cached data stored in {location}")
 
 
-def parse_args(argv):
+def create_parser():
     # short options taken over from ccache for familiarity
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -559,8 +587,14 @@ def parse_args(argv):
         help="Reset all statistics to 0 (not yet implemented)")
     parser.add_argument("--version", action="store_true",
                         help="Print version (not yet implemented)")
-    return parser.parse_args(argv)
+    return parser
 
 
 if __name__ == "__main__":
-    GPCache(sys.argv[1:]).main()
+    parsed_args = create_parser().parse_args()
+    logging.basicConfig(
+        format="[%(asctime)s.%(msecs)03d|%(levelname)s|%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.DEBUG if parsed_args.verbose else logging.INFO)
+
+    GPCache(parsed_args).main()
