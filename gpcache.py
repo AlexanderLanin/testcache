@@ -5,7 +5,6 @@ import hashlib
 import logging
 import os
 import os.path
-import sys
 import yaml
 from errno import EPERM
 from logging import error
@@ -17,15 +16,73 @@ from ptrace.debugger import (NewProcessEvent, ProcessExecution,
 from ptrace.debugger.process import PtraceProcess
 from ptrace.func_call import FunctionCallOptions
 from ptrace.syscall import PtraceSyscall
+import zlib
+
+
+class Utils:
+    @staticmethod
+    def make_safe_filename(s: str):
+        # https://stackoverflow.com/questions/7406102/create-sane-safe-filename-from-any-unsafe-string
+        keepcharacters = (' ', '.', '_')
+        return "".join(c for c in s if c.isalnum()
+                       or c in keepcharacters).rstrip()
+
+    @ staticmethod
+    def read_c_string(process: PtraceProcess, addr) -> str:
+        """Read C-String from process memory space at addr and return it."""
+        data, truncated = process.readCString(addr, 5000)
+        if truncated:
+            return None  # fail in an obvious way for now
+        return data.decode('ASCII')
+
+    # Surprisingly common use case
+    @ staticmethod
+    def read_filename_from_syscall_parameter(
+            syscall: PtraceSyscall, argument_name: str) -> str:
+        cstring: str = Utils.read_c_string(
+            syscall.process, syscall[argument_name].value)
+        filename: str = os.fsdecode(cstring)
+        return filename
+
+    @ staticmethod
+    def calculate_hash_of_str(string, digest_size=5):
+        if isinstance(string, list):
+            string = '_'.join(string)
+        if isinstance(string, str):
+            string = string.encode('ASCII')
+
+        hash = hashlib.blake2b(digest_size=digest_size)
+        hash.update(string)
+        return hash.hexdigest()
+
+    @ staticmethod
+    def calculate_hash_of_file(file_path):
+        # Reuse stat call? Usually there was a stat call before this.
+        if not os.path.exists(file_path):
+            return None
+
+        # ToDo: investigate intention. cache directory content?
+        if(os.path.isdir(file_path)):
+            return "directory"
+
+        # choose digest_size depending on filesize?!
+        h = hashlib.blake2b(digest_size=16)
+
+        with open(file_path, 'rb') as file:
+            while True:
+                # Reading is buffered, so we can read smaller chunks.
+                chunk = file.read(h.block_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+
+        return h.hexdigest()
 
 
 class Inputs:
     """Holds collection of all inputs which should lead to the same output."""
 
-    command_line: str
-    files_to_hash = {}  # path -> hash
-    files_to_stat = {}  # fd_or_filename -> stat
-    files_to_access = {}  # (pathname, mode) -> result
+    inputs = []
 
     # ToDo:
     # - cwd/pwd
@@ -33,38 +90,34 @@ class Inputs:
     #   (never ending list... but adding everything would be overkill)
     # - uid, gid ?!
 
-    def cache_additional_file(self, filename: str) -> None:
+    def cache_object(self, action, result) -> None:
+        self.inputs.append({'action': action, 'result': result})
+
+    def cache_file(self, filename: str) -> None:
         if filename == "/dev/urandom":
             # bad idea trying to hash that... probably check for regular files?
-            error("random number is used!")
+            # design decision pending: how to trigger not cacheable throughout
+            # the code?
+            raise(Exception("Cannot cache: random number is used!"))
         else:
-            self.files_to_hash[filename] = Utils.calculate_hash_of_file(
-                filename)
+            self.cache_object(("filehash", filename),
+                              Utils.calculate_hash_of_file(filename))
 
     def cache_stat(self, fd_or_filename) -> None:
         try:
-            stat_result: os.stat_result = os.stat(fd_or_filename)
+            stat_result = os.stat(fd_or_filename)
         except FileNotFoundError:
             stat_result = None
 
-        self.files_to_stat[fd_or_filename] = stat_result
+        self.cache_object(("stat", fd_or_filename), stat_result)
 
     def cache_access(self, pathname, mode, result) -> None:
-        self.files_to_access[(pathname, mode)] = result
+        self.cache_object(("access", pathname, mode), result)
 
     def print_summary(self) -> None:
-        log = logging.getLogger("gpcache").debug
-
-        log("command_line: %s", self.command_line)
-
-        for file, digest in self.files_to_hash.items():
-            log("hash: %s = %s", file, digest)
-
-        for fd_or_filename, stat_result in self.files_to_stat.items():
-            log("stat: %s = %s", fd_or_filename, stat_result)
-
-        for access_params, access_result in self.files_to_access.items():
-            log("access: %s = %s", access_params, access_result)
+        debug = logging.getLogger("gpcache").debug
+        for obj in self.inputs:
+            debug("hash: %s", obj)
 
 
 class Outputs:
@@ -94,86 +147,52 @@ class Outputs:
             log("stat: %s = %s", file, content)
 
 
-class Utils:
-    @staticmethod
-    def read_c_string(process: PtraceProcess, addr) -> str:
-        """Read C-String from process memory space at addr and return it."""
-        data, truncated = process.readCString(addr, 5000)
-        if truncated:
-            return None  # fail in an obvious way for now
-        return data.decode('ASCII')
-
-    # Surprisingly common use case
-    @staticmethod
-    def read_filename_from_syscall_parameter(
-            syscall: PtraceSyscall, argument_name: str) -> str:
-        cstring: str = Utils.read_c_string(
-            syscall.process, syscall[argument_name].value)
-        filename: str = os.fsdecode(cstring)
-        return filename
-
-    @staticmethod
-    def calculate_hash_of_str(string):
-        if isinstance(string, list):
-            string = '_'.join(string)
-        if isinstance(string, str):
-            string = string.encode('ASCII')
-
-        return hashlib.sha256(string).hexdigest()
-
-    @ staticmethod
-    def calculate_hash_of_file(file_path):
-        # Reuse stat call? Usually there was a stat call before this.
-        if not os.path.exists(file_path):
-            return None
-
-        # ToDo: investigate intention. cache directory content?
-        if(os.path.isdir(file_path)):
-            return "directory"
-
-        h = hashlib.sha256()
-
-        with open(file_path, 'rb') as file:
-            while True:
-                # Reading is buffered, so we can read smaller chunks.
-                chunk = file.read(h.block_size)
-                if not chunk:
-                    break
-                h.update(chunk)
-
-        return h.hexdigest()
-
-
 class FileBackend:
-    """Stores cache in local files"""
+    """
+    Stores cache in local files
+
+    Uses directories to represent tree of all possible inputs.
+    Maybe not the best idea. Works for now.
+    """
 
     # ToDo: XDG
     # ToDo: configurable
     CACHE_DIR: str = ".cache_dir"
 
-    def store(self, command_line, inputs: Inputs, outputs: Outputs) -> str:
+    def store(self, inputs: Inputs, outputs: Outputs) -> str:
         """Stores data in cache and returns unique cache identifier"""
 
-        path = self._get_directory_name(command_line)
+        def make_safe_short_filename(input, target_length=20) -> str:
+            input = str(input)
+            if len(input) > target_length:
+                # no idea what a good number is
+                digest_size = int(len(input) / 10)
+                if digest_size > target_length - 5:
+                    digest_size = target_length - 5
 
-        # this should actually iterate over all inputs, regardless of type and
-        # check stats, access etc in exactly the right order
-        for file in inputs.files_to_hash:
-            path += f"/{Utils.calculate_hash_of_str(file)}"
+                input = input[:(target_length - digest_size)] + \
+                    Utils.calculate_hash_of_str(input, digest_size)
+            return Utils.make_safe_filename(input)
 
+        path = self.CACHE_DIR
+
+        for input in inputs.inputs:
+            path += "/" + make_safe_short_filename(str(input['action']))
             os.makedirs(path, 0o777, True)
 
-            filename_file = f"{path}/filename.yaml"
-            if os.path.exists(filename_file):
-                with open(filename_file, "r") as filename_yaml:
-                    o = yaml.safe_load(filename_yaml)
+            # In case the directory is not sufficiently unique after making it
+            # safe, the exact command is compared via yaml file:
+            action_path = f"{path}/action.yaml"
+            if os.path.exists(action_path):
+                with open(action_path, "r") as action_yaml:
+                    o = yaml.safe_load(action_yaml)
+                    # ToDo: compare to input['action']
                     logging.warning(o)
             else:
-                with open(filename_file, "w") as input_yaml:
-                    yaml.safe_dump(file, input_yaml)
+                with open(action_path, "w") as action_yaml:
+                    yaml.safe_dump(str(input['action']), action_yaml)
 
-            path += f"/{Utils.calculate_hash_of_file(file)}"
-
+            path += "/" + make_safe_short_filename(str(input['result']))
         os.makedirs(path, 0o777, True)
 
         with open(f"{path}/outputs.yaml", "w") as outputs_yaml:
@@ -191,20 +210,13 @@ class FileBackend:
     def clear(self) -> None:
         pass
 
-    # Does python have a concept of private methods?
-    def _get_directory_name(self, command_line):
-        command_line_hash = Utils.calculate_hash_of_str(command_line)
-        executable_hash = Utils.calculate_hash_of_file(command_line[0])
-        directory = f"{self.CACHE_DIR}/{command_line_hash}/{executable_hash}"
-        return directory
-
 
 O_READONLY: int = 0
 O_CLOEXEC: int = 0o2000000
 
 
 class FiledescriptorManager:
-    """Tracking and especially debugging file descriptor access requires more than a simple array access."""
+    """For tracking and especially debugging file descriptor access."""
 
     fd_to_file_and_state = {}
 
@@ -274,8 +286,8 @@ class FiledescriptorManager:
 
         if self.fd_to_file_and_state[fd]["state"] != "open":
             self.print_all()
-            raise Exception(
-                f"retrieving closed fd {fd} => {self.fd_to_file_and_state[fd]}")
+            raise Exception(f"retrieving closed fd {fd} "
+                            f"=> {self.fd_to_file_and_state[fd]}")
 
         self.fd_to_file_and_state[fd]["source"].append(
             f"get_filename via {source}")
@@ -299,7 +311,7 @@ class SyscallListener:
 
     # Terrible design. Pass Inputs from outside?!
     def set_command_line(self, command_line):
-        self.inputs.command_line = command_line
+        self.inputs.cache_object("command line", command_line)
 
     @ staticmethod
     def ignore_syscall(syscall: PtraceSyscall) -> bool:
@@ -385,7 +397,7 @@ class SyscallListener:
                     syscall, 'filename')
 
                 if readonly:
-                    self.inputs.cache_additional_file(filename)
+                    self.inputs.cache_file(filename)
                     log_syscall = False
                 else:
                     logging.getLogger("gpcache").warning(
@@ -510,7 +522,8 @@ class GPCache():
     """
     This is basically the user interface class.
 
-    It will probably also contain stuff like printing statistics and clearing cache.
+    It will probably also contain stuff like printing statistics and clearing
+    cache.
     """
 
     def __init__(self, argv):
@@ -550,7 +563,7 @@ class GPCache():
             logging.getLogger("gpcache").debug("\n\nCached output:")
             outputs.print_summary()
 
-            location = backend.store(self.args.program, inputs, outputs)
+            location = backend.store(inputs, outputs)
             logging.getLogger("gpcache").debug(
                 f"cached data stored in {location}")
 
@@ -560,7 +573,8 @@ def create_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "program", nargs='+',
-        help="Full command line with parameters which this tool is supposed to cache")
+        help="Full command line with parameters which this tool is"
+             " supposed to cache")
     parser.add_argument(
         "-v",
         "--verbose",
@@ -574,7 +588,8 @@ def create_parser():
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Run program and verify cache instead of using cached results (not yet implemented)")
+        help="Run program and verify cache instead of using cached results"
+             " (not yet implemented)")
     parser.add_argument(
         "-C",
         "--clear_cache",
