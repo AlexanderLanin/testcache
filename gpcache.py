@@ -6,6 +6,7 @@ import logging
 import os
 import os.path
 import yaml
+import typing
 from errno import EPERM
 from logging import error
 
@@ -16,7 +17,10 @@ from ptrace.debugger import (NewProcessEvent, ProcessExecution,
 from ptrace.debugger.process import PtraceProcess
 from ptrace.func_call import FunctionCallOptions
 from ptrace.syscall import PtraceSyscall
-import zlib
+
+info = logging.getLogger("gpcache").info
+warn = logging.getLogger("gpcache").warning
+log_debug = logging.getLogger("gpcache").debug
 
 
 class Utils:
@@ -115,7 +119,7 @@ class Inputs:
         self.cache_object(("access", pathname, mode), result)
 
     def print_summary(self) -> None:
-        debug = logging.getLogger("gpcache").debug
+        debug = log_debug
         for obj in self.inputs:
             debug("hash: %s", obj)
 
@@ -138,7 +142,7 @@ class Outputs:
         self.stderr += stderr
 
     def print_summary(self) -> None:
-        log = logging.getLogger("gpcache").debug
+        log = log_debug
 
         log("stdout: %s", self.stdout)
         log("stderr: %s", self.stderr)
@@ -155,44 +159,61 @@ class FileBackend:
     Maybe not the best idea. Works for now.
     """
 
-    # ToDo: XDG
-    # ToDo: configurable
+    # ToDo: XDG / configurable
     CACHE_DIR: str = ".cache_dir"
+
+    @staticmethod
+    def yaml_from_file(filepath) -> typing.Any:
+        if not os.path.exists(filepath):
+            warn(f"yaml_from_file({filepath})")
+            return None
+        with open(filepath, "r") as yamlfile:
+            return yaml.safe_load(yamlfile)
+
+    # max path length is limited (for some reason)
+    @staticmethod
+    def make_safe_short_filename(input, target_length=20) -> str:
+        input = str(input)
+        if len(input) > target_length:
+            # no idea what a good number is
+            digest_size = int(len(input) / 10)
+            if digest_size > target_length - 5:
+                digest_size = target_length - 5
+
+            input = input[:(target_length - digest_size)] + \
+                Utils.calculate_hash_of_str(input, digest_size)
+        return Utils.make_safe_filename(input)
+
+    @classmethod
+    def ensure_yaml_content(cls, yamlfile, content) -> None:
+        """ In case the directory is not sufficiently unique, the exact command is stored in yaml file """
+        filecontent = cls.yaml_from_file(yamlfile)
+        if not filecontent:
+            os.makedirs(os.path.dirname(yamlfile), 0o777, True)
+            with open(yamlfile, "w") as yamlfile:
+                yaml.safe_dump(content, yamlfile)
+        elif filecontent != content:
+            warn("Mismatch of cached action vs real action.")
+            warn("Program behaves unpredictably!")
+            warn("This program cannot be cached!")
+            warn(filecontent)
+            warn(content)
+            raise Exception("Mismatch of cached action vs real file content.")
 
     def store(self, inputs: Inputs, outputs: Outputs) -> str:
         """Stores data in cache and returns unique cache identifier"""
 
-        def make_safe_short_filename(input, target_length=20) -> str:
-            input = str(input)
-            if len(input) > target_length:
-                # no idea what a good number is
-                digest_size = int(len(input) / 10)
-                if digest_size > target_length - 5:
-                    digest_size = target_length - 5
-
-                input = input[:(target_length - digest_size)] + \
-                    Utils.calculate_hash_of_str(input, digest_size)
-            return Utils.make_safe_filename(input)
-
         path = self.CACHE_DIR
 
         for input in inputs.inputs:
-            path += "/" + make_safe_short_filename(str(input['action']))
-            os.makedirs(path, 0o777, True)
+            actionStr = str(input['action'])
+            resultStr = str(input['result'])
 
-            # In case the directory is not sufficiently unique after making it
-            # safe, the exact command is compared via yaml file:
-            action_path = f"{path}/action.yaml"
-            if os.path.exists(action_path):
-                with open(action_path, "r") as action_yaml:
-                    o = yaml.safe_load(action_yaml)
-                    # ToDo: compare to input['action']
-                    logging.warning(o)
-            else:
-                with open(action_path, "w") as action_yaml:
-                    yaml.safe_dump(str(input['action']), action_yaml)
+            path += "/" + self.make_safe_short_filename(actionStr)
+            self.ensure_yaml_content(f"{path}/action.yaml", actionStr)
+            path += "/" + self.make_safe_short_filename(resultStr)
+            self.ensure_yaml_content(f"{path}/result.yaml", resultStr)
 
-            path += "/" + make_safe_short_filename(str(input['result']))
         os.makedirs(path, 0o777, True)
 
         with open(f"{path}/outputs.yaml", "w") as outputs_yaml:
@@ -203,8 +224,30 @@ class FileBackend:
         return path
 
     def retrieve(self, command_line) -> Outputs:
+        path = f"{self.CACHE_DIR}/command line/{self.make_safe_short_filename(str(command_line))}"
+        cached = self.yaml_from_file(f"{path}/result.yaml")
+        if not cached:
+            info("command line is not cached")
+            return None
+
+        if cached != str(command_line):
+            warn("Hash collision of cached command_line.")
+            warn("Out of scope of proof of concept!")
+            warn("This program cannot be cached!")
+            return None
+
         # Descend directory tree as long as there is exactly one further
         # directory or outputs.yaml
+        subfolders = [f.path for f in os.scandir(path) if f.is_dir()]
+        if len(subfolders) == 1:
+            path = f"/{subfolders[0]}"
+            cached = self.yaml_from_file(f".{path}/action.yaml")
+            if not cached:
+                warn("error in cache")
+                return None
+
+            # next here. call function based on cached[0] ?
+            warn(f"todo: handle {cached}")
         pass
 
     def clear(self) -> None:
@@ -229,9 +272,9 @@ class FiledescriptorManager:
             "filename": 2, "state": "open", "source": ["default"]}
 
     def print_fd(self, fd) -> None:
-        log = logging.getLogger("gpcache").debug
+        log = log_debug
 
-        logging.getLogger("gpcache").debug(f"file desciptor {fd}:")
+        log_debug(f"file desciptor {fd}:")
         # ToDo wrap all access and allow readonly array access for
         # FiledescriptorManager?
         file_and_state = self.fd_to_file_and_state[fd]
@@ -244,7 +287,7 @@ class FiledescriptorManager:
         log("---------------")
 
     def print_all(self) -> None:
-        log = logging.getLogger("gpcache").debug
+        log = log_debug
 
         log("Known file desciptors:")
         for fd, file_and_state in self.fd_to_file_and_state.items():
@@ -311,6 +354,7 @@ class SyscallListener:
 
     # Terrible design. Pass Inputs from outside?!
     def set_command_line(self, command_line):
+        warn(f"caching command_line = {command_line}")
         self.inputs.cache_object("command line", command_line)
 
     @ staticmethod
@@ -333,7 +377,7 @@ class SyscallListener:
         return f"{syscall.format():80s} = {syscall.result_text}"
 
     def display_syscall(self, syscall: PtraceSyscall) -> None:
-        logging.getLogger("gpcache").debug(
+        log_debug(
             SyscallListener.syscall_to_str(syscall))
 
     def on_signal(self, event) -> None:
@@ -341,7 +385,7 @@ class SyscallListener:
         # Note: ProcessSignal has a display() method to display its content.
         #       Use it just after receiving the message because it reads
         #       process memory to analyze the reasons why the signal was sent.
-        logging.getLogger("gpcache").debug(f"ToDo: handle signal {event}")
+        log_debug(f"ToDo: handle signal {event}")
 
     def on_process_exited(self, event: ProcessExit) -> None:
         self.outputs.exit = event.exitcode
@@ -359,20 +403,20 @@ class SyscallListener:
 
         # Display exit message
         if print_event:
-            logging.getLogger("gpcache").debug(f"*** {event} ***")
+            log_debug(f"*** {event} ***")
 
     def on_new_process_event(self, event: NewProcessEvent) -> None:
         # new process created, e.g. after a fork() syscall
         # use process.parent attribute to get the parent process.
         process = event.process
-        logging.getLogger("gpcache").debug(
+        log_debug(
             "*** New process %s ***", process.pid)
         # TODO: where is prepareProcess gone?
         # self.prepareProcess(process)
 
     def on_process_execution(self, event) -> None:
         process = event.process
-        logging.getLogger("gpcache").debug(
+        log_debug(
             "*** Process %s execution ***",
             process.pid)
 
@@ -541,9 +585,9 @@ class GPCache():
             # processExited(event)
             pass
         except PtraceError as err:
-            logging.getLogger("gpcache").debug(f"ptrace() error: {err}")
+            log_debug(f"ptrace() error: {err}")
         except KeyboardInterrupt:
-            logging.getLogger("gpcache").debug("Interrupted.")
+            log_debug("Interrupted.")
 
         return (debugger.syscall_listener.inputs,
                 debugger.syscall_listener.outputs)
@@ -554,17 +598,17 @@ class GPCache():
 
     def main(self):
         backend = FileBackend()
-        # outputs = backend.retrieve(self.args)
+        outputs = backend.retrieve(self.args.program)
 
         if self.args.program:
             inputs, outputs = GPCache.run_and_collect(self.args)
-            logging.getLogger("gpcache").debug("\n\nEverything to cache:")
+            log_debug("\n\nEverything to cache:")
             inputs.print_summary()
-            logging.getLogger("gpcache").debug("\n\nCached output:")
+            log_debug("\n\nCached output:")
             outputs.print_summary()
 
             location = backend.store(inputs, outputs)
-            logging.getLogger("gpcache").debug(
+            log_debug(
                 f"cached data stored in {location}")
 
 
